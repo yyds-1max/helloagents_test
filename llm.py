@@ -1,7 +1,7 @@
 import os
 from openai import OpenAI
 from dotenv import load_dotenv
-from typing import List, Dict
+from typing import Any, Dict, List, Optional
 
 # 加载 .env 文件中的环境变量
 load_dotenv()
@@ -49,6 +49,51 @@ class HelloAgentsLLM:
                 collected_content.append(content)
             print()  # 在流式输出结束后换行
             return "".join(collected_content)
+
+        except Exception as e:
+            print(f"❌ 调用LLM API时发生错误: {e}")
+            return None
+
+    def chat(
+        self,
+        messages: List[Dict[str, Any]],
+        tools: Optional[List[Dict[str, Any]]] = None,
+        temperature: float = 0,
+    ) -> Optional[Dict[str, Any]]:
+        """
+        调用支持原生 function calling 的 Chat Completions 接口。
+
+        与 think() 不同，这里不使用流式文本拼接，因为工具调用需要读取
+        assistant message 上的结构化 tool_calls 字段。
+        """
+        print(f"🧠 正在调用 {self.model} 模型...")
+        try:
+            request: Dict[str, Any] = {
+                "model": self.model,
+                "messages": messages,
+                "temperature": temperature,
+            }
+            if tools:
+                request["tools"] = tools
+                request["tool_choice"] = "auto"
+
+            response = self.client.chat.completions.create(**request)
+            message = response.choices[0].message
+            message_dict = message.model_dump(exclude_none=True)
+
+            if message_dict.get("content"):
+                print("✅ 大语言模型响应成功:")
+                print(message_dict["content"])
+            elif message_dict.get("tool_calls"):
+                tool_names = [
+                    tool_call["function"]["name"]
+                    for tool_call in message_dict["tool_calls"]
+                ]
+                print(f"✅ 大语言模型请求调用工具: {', '.join(tool_names)}")
+            else:
+                print("✅ 大语言模型返回了空消息。")
+
+            return message_dict
 
         except Exception as e:
             print(f"❌ 调用LLM API时发生错误: {e}")

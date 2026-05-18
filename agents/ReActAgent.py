@@ -1,27 +1,7 @@
-# ReAct 提示词模板
-REACT_PROMPT_TEMPLATE = """
-请注意，你是一个有能力调用外部工具的智能助手。
-
-可用工具如下:
-{tools}
-
-请严格按照以下格式进行回应:
-
-Thought: 你的思考过程，用于分析问题、拆解任务和规划下一步行动。
-Action: 你决定采取的行动，必须是以下格式之一:
-- `{{tool_name}}[{{tool_input}}]`:调用一个可用工具。
-- `Finish[最终答案]`:当你认为已经获得最终答案时。
-- 当你收集到足够的信息，能够回答用户的最终问题时，你必须在Action:字段后使用 Finish[最终答案] 来输出最终答案。
-
-现在，请开始解决以下问题:
-Question: {question}
-History: {history}
-"""
-
-
+import json
 import sys
 from pathlib import Path
-import re
+from typing import Any, Dict, List, Optional
 
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
 if str(PROJECT_ROOT) not in sys.path:
@@ -30,99 +10,92 @@ if str(PROJECT_ROOT) not in sys.path:
 from llm import HelloAgentsLLM
 from toolExecutor import ToolExecutor
 
+
+SYSTEM_PROMPT = """
+请注意，你是一个有能力调用外部工具的智能助手。
+
+可用工具如下:
+{tools}
+请根据用户问题自主决定是否调用工具。
+
+- 已经获得足够信息时，直接给出最终答案。
+
+不要输出 Action[...]、Finish[...] 或其他文本协议；工具调用必须使用原生 function calling。
+""".strip()
+
+
 class ReActAgent:
     def __init__(self, llm_client: HelloAgentsLLM, tool_executor: ToolExecutor, max_steps: int = 5):
         self.llm_client = llm_client
         self.tool_executor = tool_executor
         self.max_steps = max_steps
-        self.history = []
+        self.history: List[Dict[str, Any]] = []
 
-    def _parse_output(self, text: str):
-        """解析LLM的输出，提取Thought和Action。
+    def run(self, question: str) -> Optional[str]:
         """
-        # Thought: 匹配到 Action: 或文本末尾
-        thought_match = re.search(r"Thought:\s*(.*?)(?=\nAction:|$)", text, re.DOTALL)
-        # Action: 匹配到文本末尾
-        action_match = re.search(r"Action:\s*(.*?)$", text, re.DOTALL)
-        thought = thought_match.group(1).strip() if thought_match else None
-        action = action_match.group(1).strip() if action_match else None
-        return thought, action
+        使用原生 function calling 运行智能体。
+        """
+        system_prompt = SYSTEM_PROMPT.format(tools = self.tool_executor.getAvailableTools())
+        # 调试
+        print(system_prompt)
 
-    def _parse_action(self, action_text: str):
-        """解析Action字符串，提取工具名称和输入。
-        """
-        match = re.match(r"(\w+)\[(.*)\]", action_text, re.DOTALL)
-        if match:
-            return match.group(1), match.group(2)
-        return None, None
+        self.history = [
+            {"role": "system", "content": system_prompt},
+            {"role": "user", "content": question},
+        ]
+        tools = self.tool_executor.getToolSchemas()
 
-    def run(self, question: str):
-        """
-        运行ReAct智能体来回答一个问题。
-        """
-        self.history = [] # 每次运行时重置历史记录
-        current_step = 0
-
-        while current_step < self.max_steps:
-            current_step += 1
+        for current_step in range(1, self.max_steps + 1):
             print(f"--- 第 {current_step} 步 ---")
 
-            # 1. 格式化提示词
-            tools_desc = self.tool_executor.getAvailableTools()
-            history_str = "\n".join(self.history)
-            prompt = REACT_PROMPT_TEMPLATE.format(
-                tools=tools_desc,
-                question=question,
-                history=history_str
+            assistant_message = self.llm_client.chat(
+                messages=self.history,
+                tools=tools,
+                temperature=0,
             )
-
-            # 2. 调用LLM进行思考
-            messages = [{"role": "user", "content": prompt}]
-            response_text = self.llm_client.think(messages=messages)
-            
-            if not response_text:
+            if not assistant_message:
                 print("错误:LLM未能返回有效响应。")
-                break
+                return None
 
-            # 3. 解析LLM的输出
-            thought, action = self._parse_output(response_text)
-            
-            if thought:
-                print(f"思考: {thought}")
+            self.history.append(assistant_message)
+            tool_calls = assistant_message.get("tool_calls", [])
 
-            if not action:
-                print("警告:未能解析出有效的Action，流程终止。")
-                break
+            if not tool_calls:
+                final_answer = assistant_message.get("content")
+                if final_answer:
+                    print(f"🎉 最终答案: {final_answer}")
+                    return final_answer
+                print("警告:模型未返回最终答案，也未请求工具调用。")
+                return None
 
-            # 4. 执行Action
-            if action.startswith("Finish"):
-                # 如果是Finish指令，提取最终答案并结束
-                final_answer = re.match(r"Finish\[(.*)\]", action).group(1)
-                print(f"🎉 最终答案: {final_answer}")
-                return final_answer
-            
-            tool_name, tool_input = self._parse_action(action)
-            if not tool_name or not tool_input:
-                # ... 处理无效Action格式 ...
-                continue
+            for tool_call in tool_calls:
+                function_call = tool_call.get("function", {})
+                tool_name = function_call.get("name", "")
+                arguments = function_call.get("arguments", "{}")
 
-            print(f"🎬 行动: {tool_name}[{tool_input}]")
-            
-            tool_function = self.tool_executor.getTool(tool_name)
-            if not tool_function:
-                observation = f"错误:未找到名为 '{tool_name}' 的工具。"
-            else:
-                observation = tool_function(tool_input) # 调用真实工具
+                print(f"🎬 工具调用: {tool_name}({self._formatArguments(arguments)})")
+                observation = self.tool_executor.executeToolCall(tool_name, arguments)
+                print(f"👀 工具结果: {observation}")
 
-            print(f"👀 观察: {observation}")
-            
-            # 将本轮的Action和Observation添加到历史记录中
-            self.history.append(f"Action: {action}")
-            self.history.append(f"Observation: {observation}")
+                self.history.append(
+                    {
+                        "role": "tool",
+                        "tool_call_id": tool_call["id"],
+                        "name": tool_name,
+                        "content": observation,
+                    }
+                )
 
-        # 循环结束
         print("已达到最大步数，流程终止。")
         return None
+
+    def _formatArguments(self, arguments: str | Dict[str, Any]) -> str:
+        if isinstance(arguments, dict):
+            return json.dumps(arguments, ensure_ascii=False)
+        try:
+            return json.dumps(json.loads(arguments), ensure_ascii=False)
+        except json.JSONDecodeError:
+            return arguments
 
 
 if __name__ == "__main__":
@@ -134,14 +107,36 @@ if __name__ == "__main__":
         "Search",
         "一个网页搜索引擎。当你需要回答关于时事、事实以及在你的知识库中找不到的信息时，应使用此工具。",
         search,
+        {
+            "type": "object",
+            "properties": {
+                "query": {
+                    "type": "string",
+                    "description": "要搜索的关键词或问题。",
+                }
+            },
+            "required": ["query"],
+            "additionalProperties": False,
+        },
     )
     tool_executor.registerTool(
         "Calculator",
         "一个安全的计算器工具。适用于四则运算、括号、幂运算，以及 sqrt/log/sin/cos 等常见数学函数计算。",
         calculator,
+        {
+            "type": "object",
+            "properties": {
+                "expression": {
+                    "type": "string",
+                    "description": "要计算的数学表达式。",
+                }
+            },
+            "required": ["expression"],
+            "additionalProperties": False,
+        },
     )
 
     agent = ReActAgent(llm_client=llm_client, tool_executor=tool_executor)
     demo_question = "计算 (123 + 456) × 789 / 12 = ? 的结果。"
-    print(f"\n=== ReActAgent 数学计算演示 ===\n问题: {demo_question}\n")
+    print(f"\n=== Function Calling Agent 数学计算演示 ===\n问题: {demo_question}\n")
     agent.run(demo_question)
